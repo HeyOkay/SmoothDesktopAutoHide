@@ -16,6 +16,10 @@
 - **Double-click to hide**
   - Double-clicking an empty area of the desktop hides the icons.
 
+- **Safe while hidden**
+  - Hidden icons can't be clicked, and they are deselected when they fade out.
+  - Pressing a key on the desktop while the icons are hidden (including shortcuts such as Delete, F2, Ctrl+A) reveals them instead of acting on invisible files.
+
 - **Smooth fade animation**
   - Icons appear and disappear using a smooth alpha fade.
   - Animation duration is configurable from **50 to 1000 ms**.
@@ -193,7 +197,7 @@ Desktop → Application   (second Win+D / Show desktop, switching windows)
 
 - **Auto-hide timer** — the user-configured inactivity timeout.
 - **Animation timer** — runs only during a fade.
-- **Menu check timer** — runs only while a desktop context menu is open, to notice the menu closing when Explorer doesn't deliver `WM_EXITMENULOOP`.
+- **Menu check timer** — runs only while a desktop context menu is open (classic or Windows 11), to notice the menu closing when Explorer doesn't deliver `WM_EXITMENULOOP`.
 
 When the icons are idle (hidden or visible) and no menu is open, the mod runs no periodic timers at all.
 
@@ -203,10 +207,11 @@ When the mod is unloaded or disabled, it restores the desktop ListView to a norm
 
 Cleanup:
 
-1. Stops active timers.
-2. Restores full opacity and repaints the icons.
-3. Removes the ListView and ShellView subclasses.
-4. Releases the offscreen drawing buffer.
+1. Stops active timers and releases the timer resolution request.
+2. Removes the foreground WinEvent hook.
+3. Restores full opacity and repaints the icons.
+4. Removes the ListView and ShellView subclasses.
+5. Releases the offscreen drawing buffer.
 
 Restoration runs on the desktop window's own thread.
 
@@ -216,7 +221,7 @@ This prevents the mod from leaving desktop icons permanently hidden after the mo
 
 ### Enable Auto-hide
 
-Enables or disables automatic hiding.
+Enables or disables automatic hiding. When off, icons start visible and are hidden only by double-clicking empty desktop.
 
 ### Hide after seconds
 
