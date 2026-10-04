@@ -29,8 +29,18 @@
   - After the user interacts with the desktop, auto-hide is paused while the desktop remains the active surface.
   - When the desktop becomes inactive, a new full auto-hide countdown starts.
 
-- **Win+D support**
-  - The mod tracks the standard Windows `Win+D` desktop shortcut and keeps icon visibility and auto-hide state synchronized with desktop activation.
+- **Win+D and "Show desktop" support**
+  - Activating the desktop with `Win+D`, the taskbar's **Show desktop** button, or by minimizing the last window reveals the icons; leaving it the same way starts a fresh countdown.
+
+## How this differs from similar mods
+
+- **[ZenDesktop: Desktop Icon Toggle and Auto-Hide](https://windhawk.net/mods/zen-desktop-toggle-icons)** toggles icons by double-click and hides them after N seconds without any input anywhere in the system (`GetLastInputInfo()`), restoring them on any input. This mod instead ties auto-hide to the desktop itself: the countdown starts when the desktop stops being the active surface and is paused while you're on it. It also adds a smooth fade, reveals the icons with a *single* click on empty desktop, and reveals them when a file is dragged onto the desktop.
+- **[Desktop Icon Section Auto-Hide & Fluent Hover Reveal](https://windhawk.net/mods/desktop-icon-section-autohide)** reveals icons on hover and offers modes, per-app pinning and click-and-hold peek. This mod deliberately does **not** react to mouse movement: icons appear only on an explicit action (click, drag, desktop activation) and stay while the desktop is in use. It has no modes or whitelist and only three settings.
+
+## Credits
+
+- The paint-time opacity technique (blending icon and label drawing instead of making the ListView layered) follows [desktop-icon-section-autohide](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/desktop-icon-section-autohide.wh.cpp) by Piyush Das, which builds on [desktop-icons-transparency](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/desktop-icons-transparency.wh.cpp) by zed712969-crypto.
+- Inspired by [ZenDesktop: Desktop Icon Toggle and Auto-Hide](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/zen-desktop-toggle-icons.wh.cpp) by Lanbo, including its desktop window discovery approach (CreateWindowExW hook, `Progman`/`WorkerW` enumeration, subclassing `SHELLDLL_DefView` and `SysListView32`).
 
 
 ## How It Works
@@ -58,65 +68,35 @@ SysListView32
 
 The mod monitors creation of Explorer windows and looks for:
 
-- `SHELLDLL_DefView` — the desktop ShellView.
+- `SHELLDLL_DefView` — the desktop ShellView, accepted only when its parent is `Progman` or `WorkerW`. File Explorer folder views and dialogs are never touched.
 - `SysListView32` — the ListView that contains the desktop icons.
 
-Existing desktop windows are also discovered when the mod starts.
+Existing desktop windows are also discovered when the mod starts. All mod state is created and used on the desktop window's own thread.
 
 The mod subclasses both relevant windows so that it can process their messages without replacing or recreating the desktop ListView.
 
 ### Showing and hiding icons
 
-The mod directly controls the existing desktop `SysListView32` with:
+The desktop `SysListView32` is **never hidden with `ShowWindow` and never made layered**.
 
-```text
-ShowWindow(list, SW_SHOW)
-ShowWindow(list, SW_HIDE)
-```
+Instead the mod controls how the ListView *paints*. While the ListView handles `WM_PAINT`, the calls Explorer uses to draw the desktop items are intercepted:
 
-The existing ListView remains in place. The mod does not use Explorer's internal desktop-icon toggle command for normal show/hide operations.
+- `ImageList_DrawIndirect` — icons and overlays (drawn with `ILS_ALPHA`);
+- `GdiAlphaBlend` — thumbnails, label shadows and other pre-blended bitmaps;
+- `DrawShadowText` / `ExtTextOutW` — icon labels;
+- `DrawThemeBackground` — selection and hover highlights.
 
-Keeping the same ListView preserves its existing icon state and avoids an unnecessary Explorer desktop-icon refresh during visibility changes.
+Each of them is blended onto the already painted wallpaper with the current opacity. At opacity 0 nothing is drawn, so the ListView is fully transparent.
+
+While the icons are hidden, the ListView returns `HTTRANSPARENT` from `WM_NCHITTEST` and ignores keyboard input, so invisible icons cannot be clicked, opened or selected; clicks go straight to `SHELLDLL_DefView` exactly as if the ListView were hidden.
+
+Because there is no layered redirection surface and no show/hide transition, Explorer has nothing it can expose as a black background while Virtual Desktops are created or switched.
 
 ### Fade animation
 
-The fade effect is implemented on the existing ListView using `WS_EX_LAYERED` and `SetLayeredWindowAttributes`.
+Opacity uses the full 0–255 range. Progress is measured with `QueryPerformanceCounter`, frames are driven at ~8 ms with 1 ms timer resolution requested only while a fade is running, and every frame repaints the ListView once.
 
-When showing:
-
-```text
-ListView hidden
-      │
-      ▼
-ShowWindow(SW_SHOW)
-      │
-      ▼
-Alpha = 0
-      │
-      ▼
-Gradually increase alpha
-      │
-      ▼
-Alpha = 255
-      │
-      ▼
-Fully visible
-```
-
-When hiding, the same process runs in reverse:
-
-```text
-Alpha = 255
-      │
-      ▼
-Gradually decrease alpha
-      │
-      ▼
-Alpha = 0
-      │
-      ▼
-ShowWindow(SW_HIDE)
-```
+An interrupted fade continues from the current opacity, and its duration is scaled to the remaining distance so the perceived speed stays constant.
 
 The animation uses smoothstep easing:
 
@@ -191,40 +171,31 @@ This prevents the icons from disappearing while the user is actively working wit
 
 ### Drag detection
 
-The mod does not install a global low-level mouse hook.
+The mod does not poll the mouse and does not install a low-level mouse hook.
 
-Instead, a lightweight polling timer checks the physical left-button state and the window under the cursor. When the left button is held and the cursor enters the desktop surface, the mod treats this as a drag/desktop interaction and reveals the icons.
+The desktop registers an OLE `IDropTarget`. Every drag over the desktop, from any application, calls that object's `DragEnter`, `DragLeave` and `Drop` on the desktop thread. The mod hooks these three methods (reacting only to the desktop's own drop target) and reveals the icons the moment a drag enters the desktop. Auto-hide stays paused until the drag leaves or the item is dropped.
 
-This allows a drag that started in another Explorer window to reveal the desktop icons before the file is dropped.
+### Desktop activation, Win+D and Show desktop
 
-Mouse movement with no button held does not reveal the icons.
-
-
-### Win+D handling
-
-`Win+D` is handled through lightweight key-state polling because Explorer does not always send a reliable mouse or focus message to the desktop ShellView when the shortcut changes the active surface.
-
-The mod uses this state to distinguish:
+The mod installs an out-of-context `EVENT_SYSTEM_FOREGROUND` WinEvent hook on the desktop thread. When the foreground window changes:
 
 ```text
-Win+D
-  │
-  ├── Application → Desktop
-  │       └── reveal icons / pause auto-hide
-  │
-  └── Desktop → Application
-          └── start a fresh auto-hide countdown
+Application → Desktop   (Win+D, Show desktop button, last window minimized, click)
+        └── reveal icons / pause auto-hide
+
+Desktop → Application   (second Win+D / Show desktop, switching windows)
+        └── start a fresh auto-hide countdown
 ```
+
+`Win+D` and the taskbar's **Show desktop** button go through exactly the same path: both make the desktop the foreground surface, so the mod doesn't need to know which one was used. No keyboard state is polled.
 
 ### Timers
 
-The implementation uses separate timers for different jobs:
+- **Auto-hide timer** — the user-configured inactivity timeout.
+- **Animation timer** — runs only during a fade.
+- **Menu check timer** — runs only while a desktop context menu is open, to notice the menu closing when Explorer doesn't deliver `WM_EXITMENULOOP`.
 
-- **Auto-hide timer** — controls the user-configured inactivity timeout.
-- **Interaction/drag polling timer** — runs at a short interval to detect drag entry, reconcile desktop activity, recover menu/button state, and track `Win+D`.
-- **Animation timer** — updates the ListView alpha during fade transitions.
-
-These responsibilities are kept separate so that interaction polling does not reset the user's auto-hide countdown.
+When the icons are idle (hidden or visible) and no menu is open, the mod runs no periodic timers at all.
 
 ## Cleanup and Safety
 
@@ -233,11 +204,11 @@ When the mod is unloaded or disabled, it restores the desktop ListView to a norm
 Cleanup:
 
 1. Stops active timers.
-2. Restores full opacity.
-3. Removes the temporary layered-window style.
-4. Makes the desktop ListView visible if it was hidden by the mod.
-5. Removes the ListView and ShellView subclasses.
-6. Resets the internal state.
+2. Restores full opacity and repaints the icons.
+3. Removes the ListView and ShellView subclasses.
+4. Releases the offscreen drawing buffer.
+
+Restoration runs on the desktop window's own thread.
 
 This prevents the mod from leaving desktop icons permanently hidden after the mod is disabled or Explorer is restarted.
 
@@ -261,12 +232,3 @@ Duration of the fade animation.
 - **Range:** 50–1000 ms
 - **Default:** 250 ms
 
-## Known Issue
-
-### Virtual Desktops
-
-When switching to a newly created Windows Virtual Desktop, a **black background/visual artifact** may occasionally appear behind the desktop icons while the icons are visible.
-
-This is related to the interaction between the layered `SysListView32` window and Explorer's rendering/composition behavior during Virtual Desktop transitions.
-
-The issue does not affect the core functionality of the mod and is currently considered a known issue.
