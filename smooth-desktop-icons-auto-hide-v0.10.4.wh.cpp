@@ -3,7 +3,7 @@
 // @name            Smooth Desktop Icons Auto-Hide
 // @description     Smoothly auto-hide Windows desktop icons with click-to-show, double-click-to-hide, drag reveal and configurable fade animation.
 // @version         0.10.4
-// @author          overzu
+// @author          HeyOkay
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -lcomctl32 -lshell32
