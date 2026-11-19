@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              smooth-desktop-icons-auto-hide
 // @name            Smooth Desktop Icons Auto-Hide
-// @description     Smoothly auto-hide Windows desktop icons with click-to-show, double-click-to-hide, drag reveal and configurable fade animation.
-// @version         0.14.2
+// @description     Smoothly auto-hide Windows desktop icons with click-to-show, double-click-to-hide, drag reveal and configurable fade or ripple animation.
+// @version         0.15.0
 // @author          HeyOkay
 // @github           https://github.com/HeyOkay
 // @license          MIT
@@ -29,12 +29,13 @@ Automatically hides desktop icons when you're not using the desktop and smoothly
 - **Drag & drop.** Dragging a file onto the desktop reveals the icons before you drop it.
 - **Win+D and Show desktop.** Showing the desktop with `Win+D`, the taskbar's **Show desktop** button, or by minimizing the last window reveals the icons; leaving it starts a fresh countdown.
 - **Smooth fade.** Configurable duration, no wallpaper dimming, works on all Virtual Desktops.
+- **Optional ripple effect.** Instead of a uniform fade, icons can shrink and fade out in a wave starting from the cursor, and pop back in the same way. Reversing mid-animation continues from where each icon is.
 - **Safe while hidden.** Hidden icons can't be clicked and are deselected. Pressing a key on the desktop (including Delete, F2, Ctrl+A) reveals them instead of acting on invisible files.
 
 ## How this differs from similar mods
 
 - **[ZenDesktop: Desktop Icon Toggle and Auto-Hide](https://windhawk.net/mods/zen-desktop-toggle-icons)** toggles icons by double-click and hides them after N seconds without any input anywhere in the system (`GetLastInputInfo()`), restoring them on any input. This mod instead ties auto-hide to the desktop itself: the countdown starts when the desktop stops being the active surface and is paused while you're on it. It also adds a smooth fade, reveals the icons with a *single* click on empty desktop, and reveals them when a file is dragged onto the desktop.
-- **[Desktop Icon Section Auto-Hide & Fluent Hover Reveal](https://windhawk.net/mods/desktop-icon-section-autohide)** reveals icons on hover and offers modes, per-app pinning and click-and-hold peek. This mod deliberately does **not** react to mouse movement: icons appear only on an explicit action (click, drag, desktop activation) and stay while the desktop is in use. It has no modes or whitelist and only three settings.
+- **[Desktop Icon Section Auto-Hide & Fluent Hover Reveal](https://windhawk.net/mods/desktop-icon-section-autohide)** reveals icons on hover and offers modes, per-app pinning and click-and-hold peek. This mod deliberately does **not** react to mouse movement: icons appear only on an explicit action (click, drag, desktop activation) and stay while the desktop is in use. It has no modes or whitelist and only a few settings.
 
 ## How it works
 
@@ -44,7 +45,10 @@ The desktop icon list is never hidden or made transparent as a window. Instead, 
 
 - **Enable Auto-hide** — hide icons automatically after leaving the desktop. When off, icons start visible and are hidden only by double-clicking empty desktop.
 - **Hide after seconds** — delay before icons are hidden (1–60, default 5).
-- **Animation duration (ms)** — fade duration (50–1000, default 250).
+- **Animation duration (ms)** — fade duration, or per-icon duration for the ripple effect (50–1000, default 250).
+- **Effect** — Fade (default) or Ripple.
+- **Ripple spread (ms)** — ripple only: time for the wave to travel from the nearest to the farthest icon (0–1500, default 380).
+- **Smallest icon size (%)** — ripple only: icon size at the start of showing / end of hiding; 100 disables scaling (10–100, default 55).
 
 ## Credits
 
@@ -63,7 +67,18 @@ The desktop icon list is never hidden or made transparent as a window. Instead, 
   $description: "Inactivity time before icons are hidden. Range: 1-60."
 - animationDuration: 250
   $name: Animation duration (ms)
-  $description: "Fade duration. Range: 50-1000 ms."
+  $description: "Fade duration, or per-icon duration for the ripple effect. Range: 50-1000 ms."
+- effect: fade
+  $name: Effect
+  $options:
+  - fade: Fade
+  - ripple: Ripple (icons shrink/pop in a wave from the cursor)
+- rippleSpread: 380
+  $name: Ripple spread (ms)
+  $description: "Ripple only. Time for the wave to travel from the nearest to the farthest icon. Range: 0-1500 ms."
+- minScale: 55
+  $name: Smallest icon size (%)
+  $description: "Ripple only. Icon size at the start of showing / end of hiding. 100 disables the scale effect. Range: 10-100."
 */
 // ==/WindhawkModSettings==
 
@@ -74,6 +89,7 @@ The desktop icon list is never hidden or made transparent as a window. Instead, 
 #include <uxtheme.h>
 #include <mmsystem.h>
 #include <atomic>
+#include <math.h>
 #include <windhawk_utils.h>
 
 static constexpr UINT_PTR kTimerAutoHide = 0x53444901;
@@ -102,7 +118,20 @@ struct Settings {
     bool autoHideEnabled = true;
     int autoHideDelay = 5;
     int animationDuration = 250;
+    bool ripple = false;
+    int rippleSpread = 380;
+    int minScale = 55;
 } g_settings;
+
+// Ripple: per-item geometry captured when an animation starts.
+static constexpr int kMaxRippleItems = 1024;
+struct RippleItem {
+    RECT bounds;
+    float delayMs;
+    float startU;    // progress already covered (when reversing a ripple)
+    float visDelta;  // opacity offset at startU, fades out by the end
+    int lastKey;  // alpha | scale bucket last painted; -1 = unknown
+};
 
 enum class IconState {
     Hidden,
@@ -124,6 +153,13 @@ struct DesktopState {
     LONGLONG animStart = 0;
     float animDurationMs = 0.0f;
     bool precisionHeld = false;
+
+    // Ripple animation (per-item stagger + scale).
+    bool ripple = false;
+    bool rippleShowing = false;
+    float ripplePerItemMs = 0.0f;
+    int rippleCount = 0;
+    RippleItem rippleItems[kMaxRippleItems];
 
     bool dragActive = false;
     bool interactionActive = false;
@@ -373,6 +409,19 @@ static void LoadSettings() {
     if (g_settings.animationDuration > 1000)
         g_settings.animationDuration = 1000;
 
+    g_settings.ripple =
+        wcscmp(WindhawkUtils::StringSetting::make(L"effect"), L"fade") != 0;
+
+    g_settings.rippleSpread = Wh_GetIntSetting(L"rippleSpread");
+    if (g_settings.rippleSpread < 0)
+        g_settings.rippleSpread = 0;
+    if (g_settings.rippleSpread > 1500)
+        g_settings.rippleSpread = 1500;
+
+    g_settings.minScale = Wh_GetIntSetting(L"minScale");
+    if (g_settings.minScale < 10 || g_settings.minScale > 100)
+        g_settings.minScale = g_settings.minScale < 10 ? 10 : 100;
+
     Wh_Log(
         L"Settings: autoHide=%d delay=%d animation=%d",
         static_cast<int>(g_settings.autoHideEnabled),
@@ -467,6 +516,9 @@ struct OffscreenDC {
 };
 static OffscreenDC g_offscreen{};
 
+static LONGLONG QpcNow();
+static double QpcToMs(LONGLONG ticks);
+
 static void FreeOffscreen() {
     if (g_offscreen.dc) {
         if (g_offscreen.oldBmp)
@@ -521,6 +573,50 @@ static bool ShouldIntercept() {
     return tl_paintAlpha >= 0 && tl_drawDepth == 0 && !g_unloading;
 }
 
+// Ripple context of the paint in progress on this thread (nullptr = uniform).
+struct DesktopState;
+static thread_local DesktopState* tl_rippleState = nullptr;
+static thread_local float tl_rippleElapsedMs = 0.0f;
+// Alpha of the label text most recently drawn on the desktop DC, or -1.
+// Other mods (e.g. Translucent Windows' text alpha fix) re-draw that text into
+// their own scratch DC right afterwards and then force the matching desktop
+// pixels opaque; that scratch text must use the same alpha, or hidden labels
+// come back as black text shapes.
+static thread_local int tl_lastTextAlpha = -1;
+
+static float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+static float SmoothStep01(float t) { t = Clamp01(t); return t * t * (3.0f - 2.0f * t); }
+static float EaseOutBack(float t) {
+    const float c1 = 1.70158f, c3 = c1 + 1.0f;
+    const float u = t - 1.0f;
+    return 1.0f + c3 * u * u * u + c1 * u * u;
+}
+static float EaseInBack(float t) {
+    const float c1 = 1.70158f, c3 = c1 + 1.0f;
+    return c3 * t * t * t - c1 * t * t;
+}
+
+// Alpha (0-255) and scale for something drawn at rc. Falls back to the uniform
+// alpha when no ripple is running or rc isn't inside a known item.
+static int RippleLookup(const RECT& rc, float* scaleOut);
+
+// True for small offscreen DCs that Explorer/comctl32 render pieces into
+// (e.g. label text with its shadow) before compositing them onto the desktop.
+// Their coordinates start at (0,0), so they must not be matched to items.
+static bool IsScratchDC(HDC hdc);
+
+static int PaintAlphaFor(HDC hdc, const RECT& rc, float* scaleOut = nullptr) {
+    if (scaleOut)
+        *scaleOut = 1.0f;
+    if (!tl_rippleState)
+        return tl_paintAlpha;
+    // Draw scratch content natively; the composite onto the desktop DC is
+    // what gets the item's alpha.
+    if (IsScratchDC(hdc))
+        return 255;
+    return RippleLookup(rc, scaleOut);
+}
+
 // Copy what is already painted under rc into an offscreen DC, let draw()
 // render into it using the same logical coordinates, then blend the result
 // back with the requested constant alpha.
@@ -569,7 +665,12 @@ static BOOL WINAPI HookGdiAlphaBlend(
     BLENDFUNCTION bf) {
 
     if (ShouldIntercept()) {
-        const int a = tl_paintAlpha;
+        // Fade only: these blits also carry label/shadow bitmaps, which must
+        // stay aligned with the text, so they are never scaled.
+        const RECT rc{x, y, x + w, y + h};
+        if (tl_rippleState && !IsScratchDC(dst))
+            tl_lastTextAlpha = -1;
+        const int a = PaintAlphaFor(dst, rc);
         if (a <= 0)
             return TRUE;
         bf.SourceConstantAlpha =
@@ -579,13 +680,161 @@ static BOOL WINAPI HookGdiAlphaBlend(
     return g_GdiAlphaBlend(dst, x, y, w, h, src, sx, sy, sw, sh, bf);
 }
 
+// Transparent 32bpp buffer for scaled icon drawing (desktop thread only).
+struct IconBuffer {
+    HDC dc;
+    HBITMAP bmp;
+    HBITMAP oldBmp;
+    DWORD* bits;
+    int w;
+    int h;
+};
+static IconBuffer g_iconBuf{};
+
+static void FreeIconBuffer() {
+    if (g_iconBuf.dc) {
+        if (g_iconBuf.oldBmp)
+            SelectObject(g_iconBuf.dc, g_iconBuf.oldBmp);
+        if (g_iconBuf.bmp)
+            DeleteObject(g_iconBuf.bmp);
+        DeleteDC(g_iconBuf.dc);
+    }
+    g_iconBuf = {};
+}
+
+static HDC GetIconBuffer(HDC ref, int w, int h) {
+    if (w > 1024 || h > 1024)
+        return nullptr;
+    if (!g_iconBuf.dc) {
+        g_iconBuf.dc = CreateCompatibleDC(ref);
+        if (!g_iconBuf.dc)
+            return nullptr;
+    }
+    if (!g_iconBuf.bmp || w > g_iconBuf.w || h > g_iconBuf.h) {
+        const int nw = w > g_iconBuf.w ? w : g_iconBuf.w;
+        const int nh = h > g_iconBuf.h ? h : g_iconBuf.h;
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = nw;
+        bi.bmiHeader.biHeight = -nh;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(ref, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bmp || !bits)
+            return nullptr;
+        HBITMAP old = static_cast<HBITMAP>(SelectObject(g_iconBuf.dc, bmp));
+        if (g_iconBuf.bmp)
+            DeleteObject(g_iconBuf.bmp);
+        else
+            g_iconBuf.oldBmp = old;
+        g_iconBuf.bmp = bmp;
+        g_iconBuf.bits = static_cast<DWORD*>(bits);
+        g_iconBuf.w = nw;
+        g_iconBuf.h = nh;
+    }
+    for (int row = 0; row < h; ++row)
+        ZeroMemory(g_iconBuf.bits + row * g_iconBuf.w, w * sizeof(DWORD));
+    return g_iconBuf.dc;
+}
+
+// Draws the image into a transparent buffer, then blends it back scaled
+// around its centre with constant alpha a.
+static bool DrawImageListScaled(const IMAGELISTDRAWPARAMS* p, int cx, int cy,
+                                int a, float scale) {
+    HDC mem = GetIconBuffer(p->hdcDst, cx, cy);
+    if (!mem)
+        return false;
+
+    IMAGELISTDRAWPARAMS params = *p;
+    params.hdcDst = mem;
+    params.x = 0;
+    params.y = 0;
+    params.cx = cx;
+    params.cy = cy;
+    params.rgbBk = CLR_NONE;
+    params.fState &= ~ILS_ALPHA;
+    ++tl_drawDepth;
+    const BOOL ok = g_ImageList_DrawIndirect(&params);
+    --tl_drawDepth;
+    if (!ok)
+        return false;
+    GdiFlush();
+
+    // Mask-only (non-alpha) images leave alpha at 0. Draw them again over
+    // white: pixels that match the black-background pass belong to the image
+    // (including opaque black ones), the rest is transparent background.
+    bool anyAlpha = false;
+    for (int row = 0; row < cy && !anyAlpha; ++row) {
+        const DWORD* line = g_iconBuf.bits + row * g_iconBuf.w;
+        for (int col = 0; col < cx; ++col)
+            if (line[col] & 0xFF000000) { anyAlpha = true; break; }
+    }
+    if (!anyAlpha) {
+        DWORD* overBlack = static_cast<DWORD*>(
+            HeapAlloc(GetProcessHeap(), 0, cx * cy * sizeof(DWORD)));
+        if (!overBlack)
+            return false;
+        for (int row = 0; row < cy; ++row)
+            CopyMemory(overBlack + row * cx, g_iconBuf.bits + row * g_iconBuf.w,
+                       cx * sizeof(DWORD));
+        for (int row = 0; row < cy; ++row) {
+            DWORD* line = g_iconBuf.bits + row * g_iconBuf.w;
+            for (int col = 0; col < cx; ++col)
+                line[col] = 0x00FFFFFF;
+        }
+        ++tl_drawDepth;
+        const BOOL ok2 = g_ImageList_DrawIndirect(&params);
+        --tl_drawDepth;
+        GdiFlush();
+        for (int row = 0; ok2 && row < cy; ++row) {
+            DWORD* line = g_iconBuf.bits + row * g_iconBuf.w;
+            const DWORD* black = overBlack + row * cx;
+            for (int col = 0; col < cx; ++col) {
+                const DWORD c = black[col] & 0x00FFFFFF;
+                line[col] = (c == (line[col] & 0x00FFFFFF)) ? (c | 0xFF000000) : 0;
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, overBlack);
+        if (!ok2)
+            return false;
+    }
+
+    const DWORD baseAlpha = (p->fState & ILS_ALPHA) ? p->Frame : 255;
+    const int dw = static_cast<int>(cx * scale + 0.5f);
+    const int dh = static_cast<int>(cy * scale + 0.5f);
+    if (dw <= 0 || dh <= 0)
+        return true;
+    BLENDFUNCTION bf{};
+    bf.BlendOp = AC_SRC_OVER;
+    bf.SourceConstantAlpha = static_cast<BYTE>((baseAlpha * a + 127) / 255);
+    bf.AlphaFormat = AC_SRC_ALPHA;
+    RealAlphaBlend(p->hdcDst, p->x + (cx - dw) / 2, p->y + (cy - dh) / 2, dw, dh,
+                   mem, 0, 0, cx, cy, bf);
+    return true;
+}
+
 static BOOL WINAPI HookImageList_DrawIndirect(IMAGELISTDRAWPARAMS* p) {
     if (!p || !ShouldIntercept())
         return g_ImageList_DrawIndirect(p);
 
-    const int a = tl_paintAlpha;
+    int icx = p->cx, icy = p->cy;
+    if ((icx <= 0 || icy <= 0) && p->himl)
+        ImageList_GetIconSize(p->himl, &icx, &icy);
+    const RECT irc{p->x, p->y, p->x + icx, p->y + icy};
+    float scale = 1.0f;
+    if (tl_rippleState && !IsScratchDC(p->hdcDst))
+        tl_lastTextAlpha = -1;
+    const int a = PaintAlphaFor(p->hdcDst, irc, &scale);
     if (a <= 0)
         return TRUE;
+
+    if ((scale < 0.995f || scale > 1.005f) && icx > 0 && icy > 0 &&
+        p->cbSize >= sizeof(IMAGELISTDRAWPARAMS)) {
+        if (DrawImageListScaled(p, icx, icy, a, scale))
+            return TRUE;
+    }
 
     if (p->cbSize < sizeof(IMAGELISTDRAWPARAMS)) {
         // Old structure without fState/Frame: draw unmodified.
@@ -611,9 +860,17 @@ static int WINAPI HookDrawShadowText(
         return g_DrawShadowText(
             hdc, text, cch, prc, flags, crText, crShadow, ox, oy);
 
-    const int a = tl_paintAlpha;
+    const int a = PaintAlphaFor(hdc, *prc);
     if (a <= 0)
         return 1;
+    if (a >= 255) {
+        // Fully visible: draw natively and keep its inner calls untouched.
+        ++tl_drawDepth;
+        const int r = g_DrawShadowText(
+            hdc, text, cch, prc, flags, crText, crShadow, ox, oy);
+        --tl_drawDepth;
+        return r;
+    }
 
     const int padX = (ox < 0 ? -ox : ox) + 4;
     const int padY = (oy < 0 ? -oy : oy) + 4;
@@ -638,7 +895,28 @@ static BOOL WINAPI HookExtTextOutW(
     if (!ShouldIntercept())
         return g_ExtTextOutW(hdc, x, y, options, lprect, str, c, dx);
 
-    const int a = tl_paintAlpha;
+    int a = tl_paintAlpha;
+    if (tl_rippleState) {
+        if (IsScratchDC(hdc)) {
+            // Explorer's own label-shadow scratch (no text drawn on the
+            // desktop yet for this item) is composited later via
+            // GdiAlphaBlend at its real position, so draw it natively.
+            a = tl_lastTextAlpha >= 0 ? tl_lastTextAlpha : 255;
+        } else {
+            RECT probe{x - 1, y - 1, x + 1, y + 1};
+            if (lprect)
+                probe = *lprect;
+            a = PaintAlphaFor(hdc, probe);
+            if (!lprect || !IsRectEmpty(lprect))
+                tl_lastTextAlpha = a;
+        }
+        if (a >= 255) {
+            ++tl_drawDepth;
+            const BOOL r = g_ExtTextOutW(hdc, x, y, options, lprect, str, c, dx);
+            --tl_drawDepth;
+            return r;
+        }
+    }
     if (a <= 0)
         return TRUE;
 
@@ -709,9 +987,16 @@ static HRESULT WINAPI HookDrawThemeBackground(
     if (!ShouldIntercept() || !pRect)
         return g_DrawThemeBackground(theme, hdc, part, stateId, pRect, pClip);
 
-    const int a = tl_paintAlpha;
+    const int a = PaintAlphaFor(hdc, *pRect);
     if (a <= 0)
         return S_OK;
+    if (a >= 255) {
+        ++tl_drawDepth;
+        const HRESULT r =
+            g_DrawThemeBackground(theme, hdc, part, stateId, pRect, pClip);
+        --tl_drawDepth;
+        return r;
+    }
 
     RECT rc = *pRect;
     if (pClip)
@@ -872,6 +1157,180 @@ static void SetAlpha(
     RepaintList(state);
 }
 
+// Progress (0-1) of an item. It holds at startU until the item's delay has
+// passed, so a reversed item never jumps back while waiting.
+static float RippleItemProgress(const DesktopState* state, const RippleItem& item,
+                                float elapsedMs) {
+    const float per = state->ripplePerItemMs > 1.0f ? state->ripplePerItemMs : 1.0f;
+    const float t = elapsedMs > item.delayMs ? elapsedMs - item.delayMs : 0.0f;
+    return Clamp01(item.startU + t / per);
+}
+
+static float RippleCurveVis(bool showing, float u) {
+    return showing ? SmoothStep01(u * 1.6f) : 1.0f - SmoothStep01(u);
+}
+
+static int RippleItemValue(const DesktopState* state, const RippleItem& item,
+                           float elapsedMs, float* scaleOut) {
+    const float u = RippleItemProgress(state, item, elapsedMs);
+    const float minS = g_settings.minScale / 100.0f;
+    float vis = RippleCurveVis(state->rippleShowing, u);
+    if (item.visDelta != 0.0f && item.startU < 1.0f) {
+        // Reversed mid-way: the show and hide opacity curves aren't mirror
+        // images, so blend from the opacity the item had towards the curve.
+        const float w = 1.0f - Clamp01((u - item.startU) / (1.0f - item.startU));
+        vis = Clamp01(vis + item.visDelta * w);
+    }
+    const float scale = state->rippleShowing
+                            ? minS + (1.0f - minS) * EaseOutBack(u)
+                            : minS + (1.0f - minS) * (1.0f - EaseInBack(u));
+    if (scaleOut)
+        *scaleOut = scale;
+    return static_cast<int>(vis * 255.0f + 0.5f);
+}
+
+static int RippleItemKey(const DesktopState* state, const RippleItem& item,
+                         float elapsedMs) {
+    float scale = 1.0f;
+    const int a = RippleItemValue(state, item, elapsedMs, &scale);
+    // Hidden items look the same at any scale.
+    if (a <= 0)
+        return 0;
+    return a | (static_cast<int>(scale * 200.0f + 0.5f) << 8);
+}
+
+static int RippleLookup(const RECT& rc, float* scaleOut) {
+    DesktopState* state = tl_rippleState;
+    const int cxp = (rc.left + rc.right) / 2;
+    const int cyp = (rc.top + rc.bottom) / 2;
+    const RippleItem* item = nullptr;
+    for (int i = 0; i < state->rippleCount; ++i) {
+        const RECT& b = state->rippleItems[i].bounds;
+        if (cxp >= b.left && cxp < b.right && cyp >= b.top && cyp < b.bottom) {
+            item = &state->rippleItems[i];
+            break;
+        }
+    }
+    if (!item)
+        return tl_paintAlpha;
+
+    float scale = 1.0f;
+    const int a = RippleItemValue(state, *item, tl_rippleElapsedMs, &scale);
+    if (scaleOut)
+        *scaleOut = scale;
+    return a;
+}
+
+static bool IsScratchDC(HDC hdc) {
+    DesktopState* state = tl_rippleState;
+    if (!hdc || !state || !state->list)
+        return false;
+    if (GetObjectType(hdc) != OBJ_MEMDC)
+        return false;
+    HBITMAP bmp = static_cast<HBITMAP>(GetCurrentObject(hdc, OBJ_BITMAP));
+    BITMAP bm{};
+    if (!bmp || !GetObject(bmp, sizeof(bm), &bm))
+        return false;
+    // The icon buffer is ours: never a scratch DC from Explorer's view.
+    if (hdc == g_iconBuf.dc)
+        return false;
+    RECT client{};
+    GetClientRect(state->list, &client);
+    const int cw = client.right - client.left;
+    const int ch = client.bottom - client.top;
+    return bm.bmWidth < cw / 2 || bm.bmHeight < ch / 2;
+}
+
+// prevElapsedMs >= 0: a ripple is being interrupted after that many ms; each
+// item continues from where it is instead of restarting.
+static void SetupRipple(DesktopState* state, bool showing, float prevElapsedMs) {
+    const bool continuing = state->ripple && prevElapsedMs >= 0.0f;
+    const int prevCount = state->rippleCount;
+    state->ripple = false;
+    state->rippleCount = 0;
+    if (!g_settings.ripple || !state->list)
+        return;
+
+    const int count = static_cast<int>(SendMessageW(state->list, LVM_GETITEMCOUNT, 0, 0));
+    if (count <= 0)
+        return;
+
+    RECT client{};
+    GetClientRect(state->list, &client);
+    POINT origin{};
+    GetCursorPos(&origin);
+    ScreenToClient(state->list, &origin);
+    if (origin.x < client.left) origin.x = client.left;
+    if (origin.x > client.right) origin.x = client.right;
+    if (origin.y < client.top) origin.y = client.top;
+    if (origin.y > client.bottom) origin.y = client.bottom;
+
+    float dists[kMaxRippleItems];
+    float prevU[kMaxRippleItems];  // progress in the old direction, -1 = none
+    float prevVis[kMaxRippleItems];
+    int prevKey[kMaxRippleItems];
+    float maxDist = 1.0f;
+    int n = 0;
+    for (int i = 0; i < count && n < kMaxRippleItems; ++i) {
+        RECT bounds{};
+        bounds.left = LVIR_BOUNDS;
+        if (!SendMessageW(state->list, LVM_GETITEMRECT, i, reinterpret_cast<LPARAM>(&bounds)))
+            continue;
+        RECT icon{};
+        icon.left = LVIR_ICON;
+        if (!SendMessageW(state->list, LVM_GETITEMRECT, i, reinterpret_cast<LPARAM>(&icon)))
+            icon = bounds;
+        const float dx = (icon.left + icon.right) / 2.0f - origin.x;
+        const float dy = (icon.top + icon.bottom) / 2.0f - origin.y;
+        // Small margin so labels/overlays drawn slightly outside still match.
+        InflateRect(&bounds, 2, 2);
+        prevU[n] = -1.0f;
+        if (continuing && n < prevCount) {
+            const RippleItem& old = state->rippleItems[n];
+            if (EqualRect(&old.bounds, &bounds)) {
+                prevU[n] = RippleItemProgress(state, old, prevElapsedMs);
+                prevVis[n] =
+                    RippleItemValue(state, old, prevElapsedMs, nullptr) / 255.0f;
+                prevKey[n] = old.lastKey;
+            }
+        }
+        state->rippleItems[n].bounds = bounds;
+        dists[n] = sqrtf(dx * dx + dy * dy);
+        if (dists[n] > maxDist)
+            maxDist = dists[n];
+        ++n;
+    }
+    if (n == 0)
+        return;
+
+    for (int i = 0; i < n; ++i) {
+        RippleItem& item = state->rippleItems[i];
+        const float delay = g_settings.rippleSpread * (dists[i] / maxDist);
+        if (prevU[i] >= 0.0f) {
+            // Reversing: EaseOutBack(t) == 1 - EaseInBack(1 - t), so 1 - u
+            // keeps the item's scale continuous. Items the old wave never
+            // reached are already done; partly animated ones wait less.
+            item.startU = 1.0f - prevU[i];
+            item.delayMs = delay * (1.0f - item.startU);
+            item.visDelta = item.startU < 1.0f
+                                ? prevVis[i] - RippleCurveVis(showing, item.startU)
+                                : 0.0f;
+            item.lastKey = prevKey[i];
+        } else {
+            item.startU = 0.0f;
+            item.visDelta = 0.0f;
+            item.delayMs = delay;
+            // Hiding starts from fully drawn icons, showing from nothing.
+            item.lastKey = showing ? 0 : (255 | (200 << 8));
+        }
+    }
+
+    state->rippleCount = n;
+    state->rippleShowing = showing;
+    state->ripplePerItemMs = static_cast<float>(g_settings.animationDuration);
+    state->ripple = true;
+}
+
 static LONGLONG QpcNow() {
     LARGE_INTEGER v{};
     QueryPerformanceCounter(&v);
@@ -928,6 +1387,10 @@ static void FinishAnimation(
         KillTimer(state->shell, kTimerAnimation);
     EndTimerPrecision(state);
 
+    const bool wasRipple = state->ripple;
+    state->ripple = false;
+    if (wasRipple && state->alpha == state->animTo)
+        RepaintList(state);
     SetAlpha(state, state->animTo);
 
     state->state =
@@ -951,6 +1414,31 @@ static void TickAnimation(
 
     if (progress >= 1.0f) {
         FinishAnimation(state);
+        return;
+    }
+
+    if (state->ripple) {
+        state->alpha = EaseAlpha(state->animFrom, state->animTo, progress);
+        if (state->alpha == 255)
+            state->alpha = 254;
+
+        // Repaint only the items whose alpha/scale changed since last frame.
+        const float elapsedMs = static_cast<float>(elapsed);
+        bool any = false;
+        for (int i = 0; i < state->rippleCount; ++i) {
+            RippleItem& item = state->rippleItems[i];
+            const int key = RippleItemKey(state, item, elapsedMs);
+            if (key == item.lastKey)
+                continue;
+            item.lastKey = key;
+            RECT r = item.bounds;
+            // Room for the scale overshoot.
+            InflateRect(&r, 8, 8);
+            InvalidateRect(state->list, &r, FALSE);
+            any = true;
+        }
+        if (any && IsWindow(state->list))
+            UpdateWindow(state->list);
         return;
     }
 
@@ -985,9 +1473,14 @@ static void AnimateTo(
                           ? targetAlpha - state->alpha
                           : state->alpha - targetAlpha;
 
+    const LONGLONG now = QpcNow();
+    const float prevElapsedMs =
+        state->ripple ? static_cast<float>(QpcToMs(now - state->animStart))
+                      : -1.0f;
+
     state->animFrom = state->alpha;
     state->animTo = targetAlpha;
-    state->animStart = QpcNow();
+    state->animStart = now;
     // An interrupted fade only covers part of the range; scale its duration
     // so the perceived speed stays constant.
     state->animDurationMs =
@@ -995,6 +1488,16 @@ static void AnimateTo(
         static_cast<float>(delta) / 255.0f;
     if (state->animDurationMs < 40.0f)
         state->animDurationMs = 40.0f;
+
+    SetupRipple(state, targetAlpha > state->alpha, prevElapsedMs);
+    if (state->ripple) {
+        state->animDurationMs = static_cast<float>(
+            g_settings.animationDuration + g_settings.rippleSpread);
+        // Hiding starts fully visible: drop below 255 now so the paint hooks
+        // are active from the first frame.
+        if (state->alpha == 255)
+            state->alpha = 254;
+    }
 
     state->state =
         targetAlpha > state->alpha
@@ -1614,9 +2117,19 @@ LRESULT CALLBACK DesktopListSubclassProc(
             break;
 
         const int prevAlpha = tl_paintAlpha;
+        DesktopState* const prevRipple = tl_rippleState;
         tl_paintAlpha = state->alpha;
+        tl_lastTextAlpha = -1;
+        if (state->ripple) {
+            tl_rippleState = state;
+            tl_rippleElapsedMs =
+                static_cast<float>(QpcToMs(QpcNow() - state->animStart));
+        } else {
+            tl_rippleState = nullptr;
+        }
         const LRESULT result =
             DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        tl_rippleState = prevRipple;
         tl_paintAlpha = prevAlpha;
         return result;
     }
@@ -1750,8 +2263,16 @@ LRESULT CALLBACK DesktopShellSubclassProc(
         (uMsg == g_msgRefresh && wParam == 0)
             ? GetOrCreateState(hWnd)
             : FindStateByShell(hWnd);
-    if (!state)
+    if (!state) {
+        if (uMsg == g_msgUninit) {
+            // Subclassed, but the initial refresh hasn't created a state yet
+            // (or all state slots were taken): just remove the subclass.
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(
+                hWnd, DesktopShellSubclassProc);
+            return 1;
+        }
         return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    }
 
     if (uMsg == g_msgRefresh && wParam == 1) {
         // Settings changed: keep the current visual state, only restart the
@@ -1891,6 +2412,7 @@ LRESULT CALLBACK DesktopShellSubclassProc(
         }
 
         FreeOffscreen();
+        FreeIconBuffer();
         WindhawkUtils::RemoveWindowSubclassFromAnyThread(
             hWnd, DesktopShellSubclassProc);
         state->shell = nullptr;
@@ -2175,6 +2697,21 @@ static void Cleanup() {
     }
 
     g_stateCount = 0;
+
+    // Also reach desktop views that were subclassed but never got a state.
+    // Views without our subclass ignore the message.
+    EnumWindows(
+        [](HWND hWnd, LPARAM) -> BOOL {
+            for (HWND shell = FindWindowExW(hWnd, nullptr, L"SHELLDLL_DefView",
+                                            nullptr);
+                 shell; shell = FindWindowExW(hWnd, shell,
+                                              L"SHELLDLL_DefView", nullptr)) {
+                if (IsDesktopShellView(shell) && IsExpectedDesktopShell(shell))
+                    SendMessageW(shell, g_msgUninit, 0, 0);
+            }
+            return TRUE;
+        },
+        0);
 }
 
 static HWND FindExistingDesktopList() {
